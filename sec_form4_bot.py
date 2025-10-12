@@ -1,14 +1,15 @@
 import requests
 from bs4 import BeautifulSoup
 import json
-from datetime import datetime
+from datetime import datetime, timedelta
 import os
-import re
 import time
 
 DISCORD_WEBHOOK = "https://discord.com/api/webhooks/1427024017126195281/XsX8beOMl7mQajGBCkCFEPPrbtWaAENxb2pCwe83GHwAZpDEw5x29nXZDu_BB1PmOv3p"
 STATE_FILE = "last_filings.json"
-SEC_RSS_URL = "https://www.sec.gov/cgi-bin/browse-edgar?action=getcurrent&type=4&company=&dateb=&owner=include&start=0&count=40&output=atom"
+
+# Official SEC daily index - this is what powers the EDGAR search interface
+SEC_DAILY_INDEX_BASE = "https://www.sec.gov/cgi-bin/browse-edgar"
 
 def load_last_filings():
     """Load the last seen filings from state file"""
@@ -29,83 +30,121 @@ def get_text(element, default=''):
     text = element.get_text(strip=True)
     return text if text else default
 
-def get_filing_details(filing_url):
-    """Fetch detailed Form 4 XML data"""
+def fetch_latest_form4_filings():
+    """Fetch the latest Form 4 filings from SEC EDGAR using the official RSS feed"""
     headers = {
-        'User-Agent': 'Discord Bot sec-form4-tracker/1.0',
-        'Accept': '*/*'
+        'User-Agent': 'Discord Bot sec-form4-tracker/1.0 (contact@example.com)',
+        'Accept': 'application/atom+xml,application/xml,text/xml,*/*',
+        'Accept-Encoding': 'gzip, deflate'
+    }
+    
+    # This RSS feed is the official SEC source for latest Form 4 filings
+    rss_url = f"{SEC_DAILY_INDEX_BASE}?action=getcurrent&type=4&company=&dateb=&owner=include&start=0&count=100&output=atom"
+    
+    try:
+        print("Fetching latest Form 4 filings from SEC EDGAR...")
+        response = requests.get(rss_url, headers=headers, timeout=15)
+        response.raise_for_status()
+        
+        soup = BeautifulSoup(response.content, 'xml')
+        entries = soup.find_all('entry')
+        
+        filings = []
+        for entry in entries:
+            # Extract filing information
+            title = get_text(entry.find('title'))
+            
+            # Get the filing link
+            link = entry.find('link')
+            filing_url = link.get('href') if link else None
+            
+            # Get the filing date/time
+            updated = get_text(entry.find('updated'))
+            
+            # Get the summary which contains additional details
+            summary = get_text(entry.find('summary'))
+            
+            if filing_url:
+                filings.append({
+                    'title': title,
+                    'filing_url': filing_url,
+                    'filing_date': updated,
+                    'summary': summary
+                })
+        
+        print(f"  Found {len(filings)} Form 4 filings")
+        return filings[:50]  # Return top 50 most recent
+        
+    except Exception as e:
+        print(f"Error fetching filings: {e}")
+        import traceback
+        traceback.print_exc()
+        return []
+
+def get_filing_xml_url(filing_url):
+    """Extract the XML document URL from a filing page"""
+    headers = {
+        'User-Agent': 'Discord Bot sec-form4-tracker/1.0 (contact@example.com)',
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8'
     }
     
     try:
-        print(f"Fetching: {filing_url}")
-        
-        # Get the filing page
         response = requests.get(filing_url, headers=headers, timeout=15)
         response.raise_for_status()
-        time.sleep(0.2)
+        time.sleep(0.15)  # Respect SEC rate limits (10 req/sec = 100ms, we use 150ms to be safe)
         
         soup = BeautifulSoup(response.content, 'html.parser')
         
-        # Find the XML document - it's usually called something like "primary_doc.xml" or just has .xml extension
-        xml_link = None
-        
-        # Look in the documents table
-        for table in soup.find_all('table'):
-            for row in table.find_all('tr'):
+        # Find the XML file in the documents table
+        for table in soup.find_all('table', class_='tableFile'):
+            for row in table.find_all('tr')[1:]:  # Skip header
                 cells = row.find_all('td')
                 if len(cells) >= 3:
-                    # Check if this row contains a document link
-                    link_cell = cells[2] if len(cells) > 2 else cells[1]
-                    link = link_cell.find('a')
-                    if link and link.get('href'):
-                        href = link['href']
-                        # Look for .xml files (but not the XSL stylesheet)
+                    doc_link = cells[2].find('a')
+                    if doc_link:
+                        href = doc_link.get('href', '')
+                        # Look for .xml but not .xsl
                         if '.xml' in href and 'xsl' not in href.lower():
-                            xml_link = 'https://www.sec.gov' + href
-                            break
-            if xml_link:
-                break
+                            return 'https://www.sec.gov' + href
         
-        if not xml_link:
-            print("  ✗ Could not find XML document")
-            return None
+        return None
         
-        print(f"  Found XML: {xml_link.split('/')[-1]}")
+    except Exception as e:
+        print(f"  Error getting XML URL: {e}")
+        return None
+
+def parse_form4_xml(xml_url):
+    """Parse Form 4 XML and extract transaction details"""
+    headers = {
+        'User-Agent': 'Discord Bot sec-form4-tracker/1.0 (contact@example.com)',
+        'Accept': 'application/xml,text/xml,*/*'
+    }
+    
+    try:
+        print(f"  Parsing XML: {xml_url.split('/')[-1]}")
+        response = requests.get(xml_url, headers=headers, timeout=15)
+        response.raise_for_status()
+        time.sleep(0.15)  # Respect SEC rate limits
         
-        # Fetch the actual XML
-        xml_response = requests.get(xml_link, headers=headers, timeout=15)
-        xml_response.raise_for_status()
-        time.sleep(0.2)
-        
-        # Parse with xml parser for proper namespace handling
-        xml_soup = BeautifulSoup(xml_response.content, 'xml')
+        soup = BeautifulSoup(response.content, 'xml')
         
         details = {}
         
-        # Find the ownershipDocument root or work with what we have
-        doc = xml_soup.find('ownershipDocument') or xml_soup
-        
-        # Extract issuer information
-        issuer = doc.find('issuer')
+        # Issuer information
+        issuer = soup.find('issuer')
         if issuer:
             details['issuer_name'] = get_text(issuer.find('issuerName'), 'N/A')
             details['ticker'] = get_text(issuer.find('issuerTradingSymbol'), 'N/A')
             details['cik'] = get_text(issuer.find('issuerCik'), 'N/A')
-            print(f"  Issuer: {details['issuer_name']} ({details['ticker']})")
-        else:
-            print("  ✗ No issuer information found")
-            return None
         
-        # Extract reporting owner
-        reporting_owner = doc.find('reportingOwner')
-        if reporting_owner:
-            owner_id = reporting_owner.find('reportingOwnerId')
+        # Reporting owner
+        owner = soup.find('reportingOwner')
+        if owner:
+            owner_id = owner.find('reportingOwnerId')
             if owner_id:
                 details['owner_name'] = get_text(owner_id.find('rptOwnerName'), 'N/A')
-                print(f"  Owner: {details['owner_name']}")
             
-            # Get relationship/title
-            relationship = reporting_owner.find('reportingOwnerRelationship')
+            relationship = owner.find('reportingOwnerRelationship')
             if relationship:
                 titles = []
                 if get_text(relationship.find('isDirector')) == '1':
@@ -116,72 +155,73 @@ def get_filing_details(filing_url):
                         titles.append(title)
                 if get_text(relationship.find('isTenPercentOwner')) == '1':
                     titles.append('10% Owner')
-                if get_text(relationship.find('isOther')) == '1':
-                    titles.append('Other')
                 
                 details['owner_title'] = ', '.join(titles) if titles else 'Beneficial Owner'
-                print(f"  Title: {details['owner_title']}")
         
-        # Parse transactions
+        # Transactions
         transactions = []
         
-        # Non-derivative transactions (regular stock trades)
-        for trans_elem in doc.find_all('nonDerivativeTransaction'):
-            trans = parse_non_derivative_transaction(trans_elem)
+        # Non-derivative transactions
+        for trans_elem in soup.find_all('nonDerivativeTransaction'):
+            trans = parse_transaction(trans_elem, is_derivative=False)
             if trans:
                 transactions.append(trans)
-                shares = trans.get('shares', '0')
-                price = trans.get('price', '0')
-                print(f"  Transaction: {trans['type']} - {shares} shares @ ${price}")
         
-        # Derivative transactions (options, warrants, etc.)
-        for trans_elem in doc.find_all('derivativeTransaction'):
-            trans = parse_derivative_transaction(trans_elem)
+        # Derivative transactions
+        for trans_elem in soup.find_all('derivativeTransaction'):
+            trans = parse_transaction(trans_elem, is_derivative=True)
             if trans:
                 transactions.append(trans)
-                shares = trans.get('shares', '0')
-                price = trans.get('price', '0')
-                print(f"  Derivative: {trans['type']} - {shares} @ ${price}")
         
         details['transactions'] = transactions
-        print(f"  ✓ Found {len(transactions)} transaction(s)")
         
-        return details if transactions else None
+        print(f"    Issuer: {details.get('issuer_name', 'N/A')} ({details.get('ticker', 'N/A')})")
+        print(f"    Owner: {details.get('owner_name', 'N/A')}")
+        print(f"    Transactions: {len(transactions)}")
+        
+        return details
         
     except Exception as e:
-        print(f"  ✗ Error: {e}")
+        print(f"  Error parsing XML: {e}")
         import traceback
         traceback.print_exc()
         return None
 
-def parse_non_derivative_transaction(trans_elem):
-    """Parse a non-derivative transaction"""
-    trans = {}
+def parse_transaction(trans_elem, is_derivative=False):
+    """Parse a transaction element"""
+    trans = {'is_derivative': is_derivative}
     
     try:
         # Security title
-        security = trans_elem.find('securityTitle')
-        trans['security'] = get_text(security.find('value'), 'Common Stock') if security else 'Common Stock'
+        if is_derivative:
+            security = trans_elem.find('derivativeSecurityTitle')
+        else:
+            security = trans_elem.find('securityTitle')
+        
+        if security:
+            trans['security'] = get_text(security.find('value'), 'Common Stock')
+        else:
+            trans['security'] = 'Common Stock'
         
         # Transaction date
         trans_date = trans_elem.find('transactionDate')
         if trans_date:
             trans['date'] = get_text(trans_date.find('value'))
         
-        # Transaction coding
+        # Transaction code
         trans_coding = trans_elem.find('transactionCoding')
         if trans_coding:
             code = get_text(trans_coding.find('transactionCode'))
             trans_map = {
                 'P': 'Purchase',
-                'S': 'Sale', 
+                'S': 'Sale',
                 'A': 'Grant/Award',
                 'D': 'Disposition',
                 'F': 'Payment',
-                'I': 'Discretionary',
                 'M': 'Exercise',
                 'G': 'Gift',
-                'W': 'Inheritance'
+                'J': 'Other',
+                'K': 'Transaction in Equity Swap'
             }
             trans['type'] = trans_map.get(code, code)
             trans['code'] = code
@@ -194,11 +234,6 @@ def parse_non_derivative_transaction(trans_elem):
             
             price_elem = amounts.find('transactionPricePerShare')
             trans['price'] = get_text(price_elem.find('value'), '0') if price_elem else '0'
-            
-            # Check if acquired or disposed
-            acq_disp = amounts.find('transactionAcquiredDisposedCode')
-            if acq_disp:
-                trans['acquired_disposed'] = get_text(acq_disp.find('value'))
         
         # Calculate dollar amount
         try:
@@ -208,158 +243,44 @@ def parse_non_derivative_transaction(trans_elem):
         except:
             trans['amount'] = 0
         
-        # Post-transaction shares owned
-        post_trans = trans_elem.find('postTransactionAmounts')
-        if post_trans:
-            shares_owned = post_trans.find('sharesOwnedFollowingTransaction')
-            if shares_owned:
-                trans['shares_owned_after'] = get_text(shares_owned.find('value'), '0')
-        
         return trans
         
     except Exception as e:
         print(f"    Error parsing transaction: {e}")
         return None
 
-def parse_derivative_transaction(trans_elem):
-    """Parse a derivative transaction (options, warrants, etc.)"""
-    trans = {}
-    trans['is_derivative'] = True
-    
-    try:
-        # Security title
-        security = trans_elem.find('securityTitle')
-        trans['security'] = get_text(security.find('value'), 'Derivative') if security else 'Derivative'
-        
-        # Transaction date
-        trans_date = trans_elem.find('transactionDate')
-        if trans_date:
-            trans['date'] = get_text(trans_date.find('value'))
-        
-        # Transaction coding
-        trans_coding = trans_elem.find('transactionCoding')
-        if trans_coding:
-            code = get_text(trans_coding.find('transactionCode'))
-            trans_map = {
-                'P': 'Purchase',
-                'S': 'Sale',
-                'A': 'Grant/Award',
-                'D': 'Disposition',
-                'M': 'Exercise',
-                'X': 'Exercise'
-            }
-            trans['type'] = trans_map.get(code, code)
-            trans['code'] = code
-        
-        # Transaction amounts
-        amounts = trans_elem.find('transactionAmounts')
-        if amounts:
-            shares_elem = amounts.find('transactionShares')
-            trans['shares'] = get_text(shares_elem.find('value'), '0') if shares_elem else '0'
-            
-            price_elem = amounts.find('transactionPricePerShare')
-            trans['price'] = get_text(price_elem.find('value'), '0') if price_elem else '0'
-        
-        # Exercise/conversion price
-        exercise_date = trans_elem.find('exerciseDate')
-        if exercise_date:
-            trans['exercise_date'] = get_text(exercise_date.find('value'))
-        
-        # Underlying security
-        underlying = trans_elem.find('underlyingSecurity')
-        if underlying:
-            underlying_title = underlying.find('underlyingSecurityTitle')
-            if underlying_title:
-                trans['underlying'] = get_text(underlying_title.find('value'))
-        
-        # Calculate amount
-        try:
-            shares_num = float(trans.get('shares', '0').replace(',', ''))
-            price_num = float(trans.get('price', '0').replace(',', ''))
-            trans['amount'] = shares_num * price_num
-        except:
-            trans['amount'] = 0
-        
-        return trans
-        
-    except Exception as e:
-        print(f"    Error parsing derivative: {e}")
-        return None
-
-def fetch_form4_filings():
-    """Fetch latest Form 4 filings from SEC EDGAR RSS feed"""
-    headers = {
-        'User-Agent': 'Discord Bot sec-form4-tracker/1.0'
-    }
-    
-    try:
-        response = requests.get(SEC_RSS_URL, headers=headers, timeout=15)
-        response.raise_for_status()
-        
-        soup = BeautifulSoup(response.content, 'xml')
-        entries = soup.find_all('entry')
-        
-        filings = []
-        for entry in entries[:10]:
-            title = get_text(entry.find('title'), 'N/A')
-            link_elem = entry.find('link')
-            link = link_elem.get('href', '') if link_elem else ''
-            updated = get_text(entry.find('updated'))
-            
-            filings.append({
-                'title': title,
-                'link': link,
-                'updated': updated
-            })
-        
-        return filings
-        
-    except Exception as e:
-        print(f"Error fetching RSS feed: {e}")
-        return []
-
 def send_discord_notification(filing, details):
-    """Send Discord notification with transaction details"""
+    """Send Discord notification"""
+    
+    # Format the filing date
+    filing_date = filing.get('filing_date', '')
+    if filing_date:
+        try:
+            # Parse ISO format date (2025-10-12T21:59:46-04:00)
+            date_obj = datetime.fromisoformat(filing_date.replace('Z', '+00:00'))
+            filing_date_fmt = date_obj.strftime('%B %d, %Y at %I:%M %p %Z')
+        except:
+            filing_date_fmt = filing_date
+    else:
+        filing_date_fmt = 'N/A'
     
     if not details or not details.get('transactions'):
-        # Fallback for failed parsing
-        company = filing['title'].split(' - ')[0] if ' - ' in filing['title'] else 'Form 4 Filing'
-        filing_date = filing.get('updated', '')
-        if filing_date:
-            try:
-                date_obj = datetime.fromisoformat(filing_date.replace('Z', '+00:00'))
-                filing_date_fmt = date_obj.strftime('%B %d, %Y at %I:%M %p UTC')
-            except:
-                filing_date_fmt = filing_date
-        else:
-            filing_date_fmt = 'N/A'
-        
+        # Basic notification
+        company = filing.get('title', 'Unknown Company').split(' - ')[0]
         embed = {
             "title": "🔔 New Form 4 Filing",
-            "description": f"**{company}**\n📅 Filed: {filing_date_fmt}\n\n[View Filing]({filing['link']})",
-            "url": filing['link'],
+            "description": f"**{company}**\n📅 Filed: {filing_date_fmt}\n\n[View Filing]({filing['filing_url']})",
+            "url": filing['filing_url'],
             "color": 3447003,
             "footer": {"text": "SEC EDGAR Form 4 Tracker"},
             "timestamp": datetime.utcnow().isoformat()
         }
     else:
-        # Rich embed with full details
+        # Rich notification
         issuer = details.get('issuer_name', 'N/A')
         ticker = details.get('ticker', 'N/A')
         owner = details.get('owner_name', 'N/A')
         title = details.get('owner_title', 'N/A')
-        
-        # Get filing date
-        filing_date = filing.get('updated', '')
-        if filing_date:
-            try:
-                # Parse ISO format date
-                date_obj = datetime.fromisoformat(filing_date.replace('Z', '+00:00'))
-                filing_date_fmt = date_obj.strftime('%B %d, %Y at %I:%M %p UTC')
-            except:
-                filing_date_fmt = filing_date
-        else:
-            filing_date_fmt = 'N/A'
         
         fields = [
             {"name": "🏢 Company", "value": f"**{issuer}**", "inline": True},
@@ -369,7 +290,6 @@ def send_discord_notification(filing, details):
             {"name": "💼 Title", "value": title, "inline": False}
         ]
         
-        # Add transactions
         transactions = details.get('transactions', [])
         total_value = 0
         
@@ -380,7 +300,6 @@ def send_discord_notification(filing, details):
             amount = trans.get('amount', 0)
             security = trans.get('security', 'Common Stock')
             
-            # Format numbers
             try:
                 shares_fmt = f"{float(shares):,.0f}"
                 if float(price) > 0:
@@ -397,7 +316,6 @@ def send_discord_notification(filing, details):
                 price_fmt = "N/A"
                 amount_fmt = "N/A"
             
-            # Emoji
             code = trans.get('code', '')
             if code in ['P', 'A', 'M', 'X']:
                 emoji = "🟢"
@@ -430,14 +348,13 @@ def send_discord_notification(filing, details):
                 "inline": False
             })
         
-        # Color based on transaction types
         has_buy = any(t.get('code') in ['P', 'A', 'M', 'X'] for t in transactions)
         has_sell = any(t.get('code') in ['S', 'D', 'F'] for t in transactions)
         color = 5763719 if has_buy and not has_sell else 15158332 if has_sell else 3447003
         
         embed = {
             "title": f"📊 Form 4: {ticker}",
-            "url": filing['link'],
+            "url": filing['filing_url'],
             "color": color,
             "fields": fields,
             "footer": {"text": "SEC EDGAR Form 4 Tracker"},
@@ -456,32 +373,44 @@ def main():
     print(f"SEC Form 4 Tracker - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     print(f"{'='*70}\n")
     
+    # Load last seen filings
     last_filings = load_last_filings()
-    last_links = set(f['link'] for f in last_filings)
+    last_urls = set(f.get('filing_url') for f in last_filings if f.get('filing_url'))
     
-    current_filings = fetch_form4_filings()
+    # Fetch current filings from official SEC RSS feed
+    current_filings = fetch_latest_form4_filings()
     
     if not current_filings:
         print("No filings fetched. Exiting.\n")
         return
     
-    print(f"Found {len(current_filings)} total filings in RSS feed")
-    
-    new_filings = [f for f in current_filings if f['link'] not in last_links]
+    # Find new filings
+    new_filings = [f for f in current_filings if f.get('filing_url') not in last_urls]
     
     if new_filings:
         print(f"\n🆕 Processing {len(new_filings)} new filing(s):\n")
-        for filing in reversed(new_filings):
-            title_short = filing['title'][:70] + '...' if len(filing['title']) > 70 else filing['title']
+        for filing in reversed(new_filings[:10]):  # Process up to 10 new filings, oldest first
+            title = filing.get('title', 'Unknown')
+            title_short = title[:65] + '...' if len(title) > 65 else title
             print(f"📄 {title_short}")
             
-            details = get_filing_details(filing['link'])
-            send_discord_notification(filing, details)
+            # Get XML URL
+            xml_url = get_filing_xml_url(filing['filing_url'])
+            
+            if xml_url:
+                # Parse the XML
+                details = parse_form4_xml(xml_url)
+                send_discord_notification(filing, details)
+            else:
+                print(f"  ✗ Could not find XML document")
+                send_discord_notification(filing, None)
+            
             print()
-            time.sleep(2)
+            time.sleep(0.5)  # Brief pause between notifications
     else:
         print("No new filings to process")
     
+    # Save state
     save_last_filings(current_filings)
     print(f"✓ State saved\n{'='*70}\n")
 
