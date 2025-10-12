@@ -6,6 +6,14 @@ on:
     - cron: '*/5 * * * *'
   workflow_dispatch: # Allows manual triggering
 
+# Prevent multiple runs from executing simultaneously
+concurrency:
+  group: sec-form4-tracker
+  cancel-in-progress: false
+
+permissions:
+  contents: write  # Required to push changes
+
 jobs:
   check-filings:
     runs-on: ubuntu-latest
@@ -13,6 +21,9 @@ jobs:
     steps:
     - name: Checkout repository
       uses: actions/checkout@v4
+      with:
+        token: ${{ secrets.GITHUB_TOKEN }}
+        persist-credentials: true
       
     - name: Set up Python
       uses: actions/setup-python@v5
@@ -31,6 +42,7 @@ jobs:
       run: |
         git config --local user.email "github-actions[bot]@users.noreply.github.com"
         git config --local user.name "github-actions[bot]"
+        git pull --rebase origin main
         git add last_filings.json
         git diff --quiet && git diff --staged --quiet || git commit -m "Update last filings state [skip ci]"
-        git push
+        git push || (git pull --rebase origin main && git push)
