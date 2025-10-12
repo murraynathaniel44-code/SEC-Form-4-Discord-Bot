@@ -6,7 +6,7 @@ import os
 import re
 import time
 
-DISCORD_WEBHOOK = "https://discord.com/api/webhooks/1426466503644942337/r5mW7kh2XlAJxbjOY7vUCRYi1g5Lt8mrrVbdRr4xlZe3JpFlXfknyYMtIGNUTKDUCNkO"
+DISCORD_WEBHOOK = "https://discord.com/api/webhooks/1427024017126195281/XsX8beOMl7mQajGBCkCFEPPrbtWaAENxb2pCwe83GHwAZpDEw5x29nXZDu_BB1PmOv3p"
 STATE_FILE = "last_filings.json"
 SEC_RSS_URL = "https://www.sec.gov/cgi-bin/browse-edgar?action=getcurrent&type=4&company=&dateb=&owner=include&start=0&count=40&output=atom"
 
