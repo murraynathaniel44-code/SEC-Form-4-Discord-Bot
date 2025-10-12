@@ -324,9 +324,19 @@ def send_discord_notification(filing, details):
     if not details or not details.get('transactions'):
         # Fallback for failed parsing
         company = filing['title'].split(' - ')[0] if ' - ' in filing['title'] else 'Form 4 Filing'
+        filing_date = filing.get('updated', '')
+        if filing_date:
+            try:
+                date_obj = datetime.fromisoformat(filing_date.replace('Z', '+00:00'))
+                filing_date_fmt = date_obj.strftime('%B %d, %Y at %I:%M %p UTC')
+            except:
+                filing_date_fmt = filing_date
+        else:
+            filing_date_fmt = 'N/A'
+        
         embed = {
             "title": "🔔 New Form 4 Filing",
-            "description": f"**{company}**\n\n[View Filing]({filing['link']})",
+            "description": f"**{company}**\n📅 Filed: {filing_date_fmt}\n\n[View Filing]({filing['link']})",
             "url": filing['link'],
             "color": 3447003,
             "footer": {"text": "SEC EDGAR Form 4 Tracker"},
@@ -339,9 +349,22 @@ def send_discord_notification(filing, details):
         owner = details.get('owner_name', 'N/A')
         title = details.get('owner_title', 'N/A')
         
+        # Get filing date
+        filing_date = filing.get('updated', '')
+        if filing_date:
+            try:
+                # Parse ISO format date
+                date_obj = datetime.fromisoformat(filing_date.replace('Z', '+00:00'))
+                filing_date_fmt = date_obj.strftime('%B %d, %Y at %I:%M %p UTC')
+            except:
+                filing_date_fmt = filing_date
+        else:
+            filing_date_fmt = 'N/A'
+        
         fields = [
             {"name": "🏢 Company", "value": f"**{issuer}**", "inline": True},
             {"name": "📈 Ticker", "value": f"**{ticker}**", "inline": True},
+            {"name": "📅 Filing Date", "value": filing_date_fmt, "inline": False},
             {"name": "👤 Insider", "value": owner, "inline": False},
             {"name": "💼 Title", "value": title, "inline": False}
         ]
