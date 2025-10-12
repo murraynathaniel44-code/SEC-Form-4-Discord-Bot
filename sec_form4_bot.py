@@ -4,11 +4,13 @@ import json
 from datetime import datetime, timedelta
 import os
 import time
+import sys
 
 DISCORD_WEBHOOK = "https://discord.com/api/webhooks/1427024017126195281/XsX8beOMl7mQajGBCkCFEPPrbtWaAENxb2pCwe83GHwAZpDEw5x29nXZDu_BB1PmOv3p"
 STATE_FILE = "last_filings.json"
+FILTERS_FILE = "ticker_filters.json"
 
-# Official SEC daily index - this is what powers the EDGAR search interface
+# Official SEC EDGAR RSS feed
 SEC_DAILY_INDEX_BASE = "https://www.sec.gov/cgi-bin/browse-edgar"
 
 def load_last_filings():
@@ -23,6 +25,67 @@ def save_last_filings(filings):
     with open(STATE_FILE, 'w') as f:
         json.dump(filings, f)
 
+def load_ticker_filters():
+    """Load ticker filters from file"""
+    if os.path.exists(FILTERS_FILE):
+        with open(FILTERS_FILE, 'r') as f:
+            data = json.load(f)
+            return set(ticker.upper() for ticker in data.get('tickers', []))
+    return set()
+
+def save_ticker_filters(tickers):
+    """Save ticker filters to file"""
+    with open(FILTERS_FILE, 'w') as f:
+        json.dump({'tickers': sorted(list(tickers))}, f, indent=2)
+
+def add_ticker_filter(ticker):
+    """Add a ticker to the filter list"""
+    filters = load_ticker_filters()
+    ticker = ticker.upper()
+    filters.add(ticker)
+    save_ticker_filters(filters)
+    return filters
+
+def remove_ticker_filter(ticker):
+    """Remove a ticker from the filter list"""
+    filters = load_ticker_filters()
+    ticker = ticker.upper()
+    filters.discard(ticker)
+    save_ticker_filters(filters)
+    return filters
+
+def clear_ticker_filters():
+    """Clear all ticker filters"""
+    save_ticker_filters(set())
+    return set()
+
+def send_filters_notification():
+    """Send a notification showing active filters"""
+    filters = load_ticker_filters()
+    
+    if filters:
+        ticker_list = ', '.join(f"**{ticker}**" for ticker in sorted(filters))
+        description = f"Currently monitoring {len(filters)} ticker(s):\n\n{ticker_list}"
+        color = 3447003  # Blue
+    else:
+        description = "No ticker filters active. Monitoring **all** Form 4 filings."
+        color = 10197915  # Gray
+    
+    embed = {
+        "title": "📋 Active Ticker Filters",
+        "description": description,
+        "color": color,
+        "footer": {"text": "Use ticker_filters.json to manage filters"},
+        "timestamp": datetime.utcnow().isoformat()
+    }
+    
+    try:
+        response = requests.post(DISCORD_WEBHOOK, json={"embeds": [embed]}, timeout=10)
+        response.raise_for_status()
+        print("✓ Filters notification sent")
+    except Exception as e:
+        print(f"✗ Error sending filters notification: {e}")
+
 def get_text(element, default=''):
     """Safely extract text from XML element"""
     if element is None:
@@ -30,8 +93,21 @@ def get_text(element, default=''):
     text = element.get_text(strip=True)
     return text if text else default
 
-def fetch_latest_form4_filings():
-    """Fetch the latest Form 4 filings from SEC EDGAR using the official RSS feed"""
+def extract_ticker_from_title(title):
+    """Extract ticker symbol from filing title if present"""
+    # Title format is usually: "Company Name (TICKER) - Form Type - Accession Number"
+    import re
+    match = re.search(r'\(([A-Z]+)\)', title)
+    if match:
+        return match.group(1).upper()
+    return None
+
+def fetch_latest_form4_filings(ticker_filters=None):
+    """Fetch the latest Form 4 filings from SEC EDGAR using the official RSS feed
+    
+    Args:
+        ticker_filters: Set of ticker symbols to filter for. If None or empty, returns all filings.
+    """
     headers = {
         'User-Agent': 'Discord Bot sec-form4-tracker/1.0 (contact@example.com)',
         'Accept': 'application/atom+xml,application/xml,text/xml,*/*',
@@ -42,7 +118,11 @@ def fetch_latest_form4_filings():
     rss_url = f"{SEC_DAILY_INDEX_BASE}?action=getcurrent&type=4&company=&dateb=&owner=include&start=0&count=100&output=atom"
     
     try:
-        print("Fetching latest Form 4 filings from SEC EDGAR...")
+        if ticker_filters:
+            print(f"Fetching Form 4 filings for tickers: {', '.join(sorted(ticker_filters))}...")
+        else:
+            print("Fetching latest Form 4 filings from SEC EDGAR...")
+        
         response = requests.get(rss_url, headers=headers, timeout=15)
         response.raise_for_status()
         
@@ -50,9 +130,20 @@ def fetch_latest_form4_filings():
         entries = soup.find_all('entry')
         
         filings = []
+        filtered_count = 0
+        
         for entry in entries:
             # Extract filing information
             title = get_text(entry.find('title'))
+            
+            # Early filtering based on ticker in title
+            ticker_in_title = extract_ticker_from_title(title)
+            
+            # If we have filters and the ticker doesn't match, skip this filing entirely
+            if ticker_filters and ticker_in_title:
+                if ticker_in_title not in ticker_filters:
+                    filtered_count += 1
+                    continue
             
             # Get the filing link
             link = entry.find('link')
@@ -69,11 +160,16 @@ def fetch_latest_form4_filings():
                     'title': title,
                     'filing_url': filing_url,
                     'filing_date': updated,
-                    'summary': summary
+                    'summary': summary,
+                    'ticker_hint': ticker_in_title  # Store the ticker we found in title
                 })
         
-        print(f"  Found {len(filings)} Form 4 filings")
-        return filings[:50]  # Return top 50 most recent
+        if ticker_filters:
+            print(f"  Found {len(filings)} matching filings (filtered out {filtered_count})")
+        else:
+            print(f"  Found {len(filings)} Form 4 filings")
+        
+        return filings[:50]  # Return top 50 most recent matching filings
         
     except Exception as e:
         print(f"Error fetching filings: {e}")
@@ -368,17 +464,64 @@ def send_discord_notification(filing, details):
     except Exception as e:
         print(f"  ✗ Discord error: {e}")
 
+def should_notify_filing(details, ticker_filters):
+    """Check if a filing should generate a notification based on filters
+    
+    This is a secondary check in case ticker wasn't in the title.
+    """
+    # If no filters, notify everything
+    if not ticker_filters:
+        return True
+    
+    # If filters exist, only notify if ticker matches
+    ticker = details.get('ticker', 'N/A').upper() if details else 'N/A'
+    return ticker in ticker_filters
+
 def main():
     print(f"\n{'='*70}")
     print(f"SEC Form 4 Tracker - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     print(f"{'='*70}\n")
     
+    # Check for command line arguments
+    if len(sys.argv) > 1:
+        command = sys.argv[1].lower()
+        
+        if command == 'filters' or command == 'tickers':
+            send_filters_notification()
+            return
+        elif command == 'add' and len(sys.argv) > 2:
+            ticker = sys.argv[2].upper()
+            filters = add_ticker_filter(ticker)
+            print(f"✓ Added {ticker} to filters")
+            print(f"Active filters: {', '.join(sorted(filters))}")
+            send_filters_notification()
+            return
+        elif command == 'remove' and len(sys.argv) > 2:
+            ticker = sys.argv[2].upper()
+            filters = remove_ticker_filter(ticker)
+            print(f"✓ Removed {ticker} from filters")
+            print(f"Active filters: {', '.join(sorted(filters)) if filters else 'None'}")
+            send_filters_notification()
+            return
+        elif command == 'clear':
+            clear_ticker_filters()
+            print("✓ Cleared all filters")
+            send_filters_notification()
+            return
+    
+    # Normal operation - check for filings
+    filters = load_ticker_filters()
+    if filters:
+        print(f"📋 Active ticker filters: {', '.join(sorted(filters))}\n")
+    else:
+        print("📋 No filters active - monitoring all tickers\n")
+    
     # Load last seen filings
     last_filings = load_last_filings()
     last_urls = set(f.get('filing_url') for f in last_filings if f.get('filing_url'))
     
-    # Fetch current filings from official SEC RSS feed
-    current_filings = fetch_latest_form4_filings()
+    # Fetch current filings from official SEC RSS feed WITH FILTERING
+    current_filings = fetch_latest_form4_filings(ticker_filters=filters)
     
     if not current_filings:
         print("No filings fetched. Exiting.\n")
@@ -388,7 +531,10 @@ def main():
     new_filings = [f for f in current_filings if f.get('filing_url') not in last_urls]
     
     if new_filings:
-        print(f"\n🆕 Processing {len(new_filings)} new filing(s):\n")
+        print(f"\n🆕 Found {len(new_filings)} new filing(s)\n")
+        notified_count = 0
+        skipped_count = 0
+        
         for filing in reversed(new_filings[:10]):  # Process up to 10 new filings, oldest first
             title = filing.get('title', 'Unknown')
             title_short = title[:65] + '...' if len(title) > 65 else title
@@ -400,13 +546,25 @@ def main():
             if xml_url:
                 # Parse the XML
                 details = parse_form4_xml(xml_url)
-                send_discord_notification(filing, details)
+                
+                # Secondary check if ticker wasn't in title (rare cases)
+                if should_notify_filing(details, filters):
+                    send_discord_notification(filing, details)
+                    notified_count += 1
+                else:
+                    ticker = details.get('ticker', 'N/A') if details else 'N/A'
+                    print(f"  ⊝ Skipped (ticker {ticker} not in filter list)")
+                    skipped_count += 1
             else:
                 print(f"  ✗ Could not find XML document")
-                send_discord_notification(filing, None)
+                if not filters:  # Only notify for parsing failures if no filters
+                    send_discord_notification(filing, None)
+                    notified_count += 1
             
             print()
             time.sleep(0.5)  # Brief pause between notifications
+        
+        print(f"✓ Sent {notified_count} notification(s), skipped {skipped_count}")
     else:
         print("No new filings to process")
     
